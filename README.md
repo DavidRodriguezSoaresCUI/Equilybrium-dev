@@ -1,3 +1,5 @@
 # [Equilybrium](https://gitlab.com/DRSCUI/equilybrium-dev)
 
-TODO
+Equilybrium is a solution that monitors your files and their backup in a flexible way for a specific use case.
+
+For more information, read [``equilybrium-whitepaper``](TODO).

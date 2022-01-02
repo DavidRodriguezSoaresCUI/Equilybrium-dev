@@ -1,0 +1,6 @@
+.vscode
+*.bat
+*.json
+*.log
+*.progress
+

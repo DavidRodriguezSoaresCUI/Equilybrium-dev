@@ -206,10 +206,13 @@ def file_collector( root: Path ) -> Tuple[int,Path,int]:
     ''' Easy to use tool to collect files matching a pattern (recursive or not), using pathlib.glob.
     Collect files matching given pattern(s) '''
 
-    for idx,item in enumerate(root.glob( '**/*' if CFG['include_noext_files'] else '**/*.*' )):
+    idx: int = 0
+    for item in root.glob( '**/*' if CFG['include_noext_files'] else '**/*.*'):
+        if not item.is_file():
+            continue
+        idx += 1
         valid_file = (
-            item.is_file()
-            and ('$RECYCLE.BIN' not in item.parts) # do not collect files in the trash
+            ('$RECYCLE.BIN' not in item.parts) # do not collect files in the trash
             and (item.suffix not in CFG['excluded_extensions']) # exclude files with certain extensions
             and ( # conditionnally avoid directories beginning with '@' symbol
                 (CFG['avoid_at_dirs'] is False)

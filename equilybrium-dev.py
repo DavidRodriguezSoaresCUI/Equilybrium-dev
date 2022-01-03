@@ -1,8 +1,20 @@
-#pylint: disable=no-name-in-module, import-error, eval-used, global-statement, unused-import
+#pylint: disable=eval-used, global-statement, unused-import, invalid-name, trailing-whitespace, line-too-long, ungrouped-imports
 ''' Script for reading and verifying file digests.
 
-On DB file size: It takes 150~200 bytes to store 1 entry, so a DB
-with 10M entries would have an estimated size around 2GB.
+On memory usage: 
+
+- At launch equilybrium uses ~30MB of RAM
+
+- in RAM: It takes 350~450 bytes to store 1 entry, so a DB
+with 1M entries would have an estimated size around 400MB.
+
+- in JSON file: It takes 140~300 bytes to store 1 entry, so a DB
+with 1M entries would have an estimated size around 200MB.
+
+- Optimizing RAM/JSON file sizes: use a hashing algorithm with smaller digest
+
+- RAM memory footprint was optimized quite a bit. Further optimization seems unwarranted
+  and would require significant changes to the code and/or to the features of Equilybrium.
 
 '''
 
@@ -11,19 +23,23 @@ import configparser
 import datetime
 import functools
 import hashlib
+import itertools
 import json
 import logging
 import sys
 import uuid
 import zlib
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from enum    import Enum
 from pathlib import Path
-from pympler.asizeof import asizeof
 from time    import time
-from DRSlib.spinner    import MySpinner
-from DRSlib.path_tools import FileCollector
-from DRSlib.utils      import LOG_FORMAT
+from typing  import List, Tuple
+
+try:
+    from pympler.asizeof import asizeof
+except ImportError:
+    print("Failed to import pympler. You can install it with `pip install -r equilybrium.requirements.txt`. Fallback `sys.getsiseof` used instead.")
+    from sys import getsizeof as asizeof
 
 #################### global config variable ####################
 
@@ -34,6 +50,7 @@ LOG_CFG = 'stderr+file'
 #################### Some setup ####################
 
 THIS_FILE = Path( __file__ ).resolve()
+LOG_FORMAT = "[%(levelname)s:%(funcName)s] %(message)s"
 LOG = logging.getLogger( __file__ )
 LOGLEVEL = logging.DEBUG
 LOG.setLevel(level=LOGLEVEL)
@@ -42,6 +59,8 @@ DEFAULT_VALUE = {
     zlib.adler32: 1,
     zlib.crc32: 0
 }
+
+DB_entry = namedtuple('DB_entry', field_names=['size','path'])
 
 #################### Helper functions/classes ####################
 
@@ -90,6 +109,11 @@ def log_event( event: Event, msg: str ) -> None:
 
 def save_DB( _DB: dict ) -> None:
     ''' Save DB object to file for later use
+    Note: By default the json library uses the following encoding representations:
+    - int dict keys as str
+    - namedtuples as list of their entries (names are lost)
+    Therefore an additional step is required (load_DB.decode_DB_entries) when loading
+    the saved DB.
     '''
     if CFG['read_only']:
         LOG.debug("--simulate: Did not save DB to file")
@@ -106,9 +130,19 @@ def load_DB() -> dict:
     ''' Load previously generated DB object from file.
     Returns None on DB file not existing
     '''
+
+    def decode_DB_entries( db: dict ):
+        ''' Implements conversion:
+          { <digest:str>: [ <DB_entry_as_list:list> ] } => { <digest:int>: [ <entry:DB_entry> ] }
+        '''
+        for k in list(db.keys()):
+            db[int(k)] = [ DB_entry( size=entry[0], path=entry[1] ) for entry in db[k] ]
+            del db[k]
+        return db
+
     _DB_f = get_DB_file_path()
     if _DB_f.is_file():
-        res = json.loads(_DB_f.read_text())
+        res = decode_DB_entries(json.loads(_DB_f.read_text() ))
         LOG.info("Loading DB from file '%s' (%d elements)", _DB_f, len(res))
         return res
 
@@ -123,7 +157,7 @@ def show_DB_file_size( _DB: dict = None) -> None:
     '''
 
     def humansize( nbytes: int ) -> str:
-        ''' code from 
+        ''' code from
           https://stackoverflow.com/questions/14996453/python-libraries-to-calculate-human-readable-filesize-from-bytes
         '''
         suffixes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
@@ -155,67 +189,110 @@ def show_DB_file_size( _DB: dict = None) -> None:
 
 
 def print_cfg() -> None:
-    ''' For debug purposes 
+    ''' For debug purposes
     '''
     global CFG
     msg = "Config:\n" + '\n'.join( f"> '{k}': {v} ({type(v)})" for k,v in CFG.items() )
     msg += "\nMonitored directories:\n" + '\n'.join( f"> {_dir}" for _dir in CFG['dirs'] )
     LOG.debug( msg )
 
+
+def file_count( root: Path ) -> int:
+    ''' Returns the number of files in `root` '''
+    return sum( 1 for item in root.glob( '**/*' if CFG['include_noext_files'] else '**/*.*' ) if item.is_file() )
+
+
+def file_collector( root: Path ) -> Tuple[int,Path,int]:
+    ''' Easy to use tool to collect files matching a pattern (recursive or not), using pathlib.glob.
+    Collect files matching given pattern(s) '''
+
+    for idx,item in enumerate(root.glob( '**/*' if CFG['include_noext_files'] else '**/*.*' )):
+        valid_file = (
+            item.is_file()
+            and ('$RECYCLE.BIN' not in item.parts) # do not collect files in the trash
+            and (item.suffix not in CFG['excluded_extensions']) # exclude files with certain extensions
+            and ( # conditionnally avoid directories beginning with '@' symbol
+                (CFG['avoid_at_dirs'] is False)
+                or (not any( p.startswith('@') for p in item.parts[:-1] ))
+            )
+        )
+        if valid_file:
+            yield idx, item, item.stat().st_size
+
+
+class MySpinner:
+    ''' My simple spinner, one-function, easy to use and supports text
+    on the left of the spinning wheel !
+    '''
+
+    def __init__( self ) -> None:
+        self.last_txt_len = 0
+        self.spinner = itertools.cycle(['-', '\\', '|', '/'])
+
+
+    def animation( self, text: str = '', no_spinner: bool = False ):
+        ''' update animation, with the option to print text on the left of the
+        spinner character
+        '''
+        tmplen = (self.last_txt_len + 1)
+        # erase previous message
+        # why do backspaces, then whitespace, then backspaces again :
+        # because backspace alone didn't consistently erase previous text
+        sys.stdout.write( '\b' * tmplen + ' ' * tmplen + '\b' * tmplen ) 
+
+        # write new message, truncated to not overflow terminal width (necessary for best results)
+        spinner_symbol = '' if no_spinner else next(self.spinner)
+        message = text + spinner_symbol
+        sys.stdout.write( 
+            message
+        )
+        sys.stdout.flush()
+        self.last_txt_len = len( message ) - (0 if no_spinner else 1)
+
 #################### Hash-related functions ####################
 
-def file_digest( _file: Path ) -> str:
+def file_digest( _file: Path ) -> int:
     ''' Returns _file's digest
     code based on maxschlepzig's answer
       https://stackoverflow.com/questions/22058048/hashing-a-file-in-python
     '''
-    hash_algorithm, block_size = CFG['Hash_algorithm'], CFG['Block_size']
+    hash_algorithm = CFG['Hash_algorithm']
+    b  = bytearray(CFG['Block_size'])
+    mv = memoryview(b)
     try:
         # hashlib version
         h = hash_algorithm()
-        b  = bytearray(block_size)
-        mv = memoryview(b)
         with _file.open('rb', buffering=0) as f:
             for n in iter(lambda : f.readinto(mv), 0):
                 h.update(mv[:n])
-        return h.hexdigest()
+        # convert bytes digest to int
+        return int.from_bytes(h.digest(), byteorder='big')
     except TypeError:
         # zlib version
-        digest = DEFAULT_VALUE[hash_algorithm]
-        b  = bytearray(block_size)
-        mv = memoryview(b)
+        digest: int = DEFAULT_VALUE[hash_algorithm]
         with _file.open('rb', buffering=0) as f:
             for n in iter(lambda : f.readinto(mv), 0):
                 digest = hash_algorithm( mv[:n], digest ) # data, value
-        return hex(digest)[2:]
+        return digest
 
 
 def hash_dir( dir_to_hash: Path, reference_DB: dict, animate: bool = True ) -> dict:
     ''' Given a directory, hash all files in it recursively,
     then return a dictionnary:
-      { <file_digest:str>: { 
-          'size': <file_size:int>, 
-          'path': <file_relative_path:str>
-        }
+      { 
+          <file_digest:int>:
+              <(size=<file_size:int>, path=<file_path:str>):DB_entry>
       }
-    Note: file_relative_path is a posix-style relative path rooted at 
+    Note: file_relative_path is a posix-style relative path rooted at
     user-selected directory (non-inclusive)
     '''
     
     # File collection and hashing
     _DB = defaultdict(list)
-    total_size = 0
+    total_size_bytes: int = 0 # count processed bytes
+    processed_files : int = 0 # count processed files
     LOG.info("Processing directory '%s' ..", dir_to_hash)
-    files = FileCollector(root=dir_to_hash).collect()
-    nb_files = len(files)
-
-    if CFG['avoid_at_dirs'] is True:
-        # filter out files that exist in directories beginning with '@' symbol
-        files = list(filter(lambda x: not any( p.startswith('@') for p in x.parts[:-1] ), files))
-        tmp = len(files)
-        if tmp != nb_files:
-            LOG.info("Ignored %d files in directories beginning with '@' symbol", nb_files-tmp )
-        nb_files = tmp
+    nb_files = file_count( dir_to_hash )
 
     if nb_files==0:
         LOG.info("No file to process")
@@ -223,15 +300,22 @@ def hash_dir( dir_to_hash: Path, reference_DB: dict, animate: bool = True ) -> d
         
     spinner = MySpinner()
     start_t = progress_t = time()
-    for idx,_file in enumerate(files):
+    for idx,_file, file_size in file_collector( dir_to_hash ):
         # stdout progress animation
         if animate:
-            spinner.animation( f"[{idx+1}/{nb_files}] ({total_size / max((time()-start_t) * 2**20,1):.1f} MiB/s) " )
+            spinner.animation( f"[{idx+1}/{nb_files}] ({total_size_bytes / max((time()-start_t) * 2**20,1):.1f} MiB/s) " )
 
-        # log progress to file
-        if 'file' in LOG_CFG and time() - progress_t > 10:
-            THIS_FILE.with_suffix(f".{CFG['role']}.progress").write_text(f"[{idx+1}/{nb_files}] ({total_size / max((time()-start_t) * 2**20,1):.1f} MiB/s)", encoding='utf8')
+        # log progress to file every 5 seconds
+        if 'file' in LOG_CFG and time() - progress_t > 5:
+            THIS_FILE.with_suffix(f".{CFG['role']}.progress").write_text(
+                f"{dir_to_hash} [{idx+1}/{nb_files}] ({total_size_bytes / max((time()-start_t) * 2**20,1):.1f} MiB/s)",
+                encoding='utf8'
+            )
             progress_t = time()
+
+        # Filter out files that are too small
+        if file_size < CFG['min_file_size']:
+            continue
         
         # compute file digest
         try:
@@ -240,13 +324,13 @@ def hash_dir( dir_to_hash: Path, reference_DB: dict, animate: bool = True ) -> d
             LOG.warning("Could not access '%s' !", _file)
             continue
         
-        # build entry
-        file_size = _file.stat().st_size
-        total_size += file_size
-        entry = {
-            'size': file_size,
-            'path': _file.relative_to(dir_to_hash).as_posix()
-        }
+        # update stats and build entry
+        processed_files += 1
+        total_size_bytes += file_size
+        entry = DB_entry(
+            size=file_size,
+            path=_file.relative_to(dir_to_hash).as_posix()
+        )
         
         # We need to check for hash collisions in the partial DB before adding
         # a new entry
@@ -263,7 +347,6 @@ def hash_dir( dir_to_hash: Path, reference_DB: dict, animate: bool = True ) -> d
             # remove entry in reference_DB when the last element reference_DB[_hash] is removed 
             if not reference_DB[_hash]:
                 del reference_DB[_hash]
-            
 
         # finally add entry
         _DB[_hash].append(entry)
@@ -276,10 +359,11 @@ def hash_dir( dir_to_hash: Path, reference_DB: dict, animate: bool = True ) -> d
     elapsed_t = time() - start_t
     LOG.info(
         "Hashed %.1f MiB in %.1f s : %.1f MiB/s",
-        total_size / 2**20,
+        total_size_bytes / 2**20,
         elapsed_t,
-        total_size / (elapsed_t * 2**20)
+        total_size_bytes / (elapsed_t * 2**20)
     )
+    LOG.info( "Skipped %d files.", nb_files-processed_files )
 
     return _DB
 
@@ -371,7 +455,8 @@ def read_config() -> dict:
             set_LOG_handlers() # re-config file handler
             break
     else:
-        raise ValueError(f"System ID {current_uuid} doesn't correspond to a role in config {config_file} !")
+        LOG.warning("System ID %s doesn't correspond to a role in config %s !", current_uuid, config_file)
+        CFG['role'] = 'UNK'
 
     # get hashing algorithm and block size for hashing
     for arg in ('Hash_algorithm','Block_size'):
@@ -381,6 +466,25 @@ def read_config() -> dict:
     # determine if directories beginning with '@' should be avoided in this instance
     CFG['avoid_at_dirs'] = CFG['role'] in _settings.get( 'Avoid_at_dirs' )
 
+    # Allows to skip small files
+    CFG['min_file_size'] = _settings.getint( 'Min_file_size' )
+
+    # Allows to skip certain extensions
+    CFG['excluded_extensions'] = set()
+    excl_ext = _settings.get('Excluded_extensions')
+    if excl_ext and isinstance(excl_ext, str):
+        CFG['excluded_extensions'] = set( 
+            item if item[0]=='.' else '.'+item 
+            for item in [
+                _item.strip().lower()
+                for _item in excl_ext.split(',')
+            ]
+        )
+
+    # Should files with no extension be included ?
+    CFG['include_noext_files'] = _settings.getboolean('Include_files_with_no_extension')
+
+
     # Read 'Monitored Directories' section
     # Read list of directories corresponding to this instance's role
     monitored_dirs_s = config['Monitored Directories'].get( CFG['role'], raw=True )
@@ -389,7 +493,7 @@ def read_config() -> dict:
     CFG['dirs'] = [
         Path( _dir )
         for _dir in json.loads(monitored_dirs_s.replace('\\', '\\\\'))
-    ]
+    ] if monitored_dirs_s else []
     # Directory existence verification
     warnings = False
     for _dir in CFG['dirs']:
@@ -409,13 +513,15 @@ def read_config() -> dict:
 
 #################### Database analysis, event detection functions ####################
 
-def verify_against_reference( reference_DB: dict, computed_hash: str, computed_item: dict ) -> dict:
+def verify_against_reference( reference_DB: dict, computed_hash: int, computed_item: DB_entry ) -> dict:
     ''' Compares reference_DB with partial computed DB for events:
     - NewFile: element in computed_DB but not in reference_DB
     - FileMovedOrRenamed: element in computed_DB has different path+same size than the one in reference_DB
     - HashCollision: element in computed_DB has different path+different size than the one in reference_DB
 
-    Returns the entry that can be removed from the reference DB (or updated with computed values): <entry> if verification is successful (file in reference, exists, may be moved/renamed), None if unsuccessful/unavailable (new file, hash collision).
+    Returns the entry that can be removed from the reference DB (or updated with computed values): <entry>
+    if verification is successful (file in reference, exists, may be moved/renamed), None if 
+    unsuccessful/unavailable (new file, hash collision).
 
     Note: this step doesn't catch (by design, another step is needed):
     - VerificationFailed
@@ -424,7 +530,7 @@ def verify_against_reference( reference_DB: dict, computed_hash: str, computed_i
 
     if computed_hash not in reference_DB:
         # NewFile
-        log_event(Event.NewFile, str(computed_item['path']))
+        log_event(Event.NewFile, str(computed_item.path))
         return None
 
     # computed_hash is in reference_DB => compare to entries
@@ -432,22 +538,22 @@ def verify_against_reference( reference_DB: dict, computed_hash: str, computed_i
     provisioned_action:       tuple = None
     provisioned_return_value: bool  = None
     for reference_item in reference_DB[computed_hash]:
-        if computed_item['path'] == reference_item['path']:
+        if computed_item.path == reference_item.path:
             # same hash+path => same file
-            if computed_item['size'] == reference_item['size']:
+            if computed_item.size == reference_item.size:
                 # verification successful
                 return reference_item
             
             # Special case: hash collision
             log_event(
                 Event.HashCollision,
-                f"Hash collision: '{reference_item['path']}' vs '{computed_item['path']}'"
+                f"Hash collision: '{reference_item.path}' vs '{computed_item.path}'"
             )
             provisioned_return_value = None
             continue
             
         
-        if computed_item['size'] == reference_item['size']:
+        if computed_item.size == reference_item.size:
             # same hash+size but different path => FileMovedOrRenamed or duplicate
             # Note: we provision a FileMovedOrRenamed because if it is a DuplicateFile,
             # it should be verified in a later iteration
@@ -455,7 +561,7 @@ def verify_against_reference( reference_DB: dict, computed_hash: str, computed_i
                 log_event,
                 (
                     Event.FileMovedOrRenamed,
-                    f"'{reference_item['path']}' -> '{computed_item['path']}'"
+                    f"'{reference_item.path}' -> '{computed_item.path}'"
                 )
             )
             provisioned_return_value = reference_item
@@ -464,7 +570,7 @@ def verify_against_reference( reference_DB: dict, computed_hash: str, computed_i
         # same hash but different path+size => HashCollision
         log_event(
             Event.HashCollision,
-            f"Hash collision: '{reference_item['path']}' vs '{computed_item['path']}'"
+            f"Hash collision: '{reference_item.path}' vs '{computed_item.path}'"
         )
         provisioned_return_value = None
 
@@ -476,7 +582,7 @@ def verify_against_reference( reference_DB: dict, computed_hash: str, computed_i
     return provisioned_return_value
 
 
-def verify_against_partial( partial_DB: defaultdict, computed_hash: str, computed_item: dict, dir_to_hash: Path ) -> bool:
+def verify_against_partial( partial_DB: defaultdict, computed_hash: int, computed_item: DB_entry, dir_to_hash: Path ) -> bool:
     ''' Compares partial DB with candidate entry. See truth table for details.
 
     Returns whether or not the entry should be added to the partial DB.
@@ -491,23 +597,23 @@ def verify_against_partial( partial_DB: defaultdict, computed_hash: str, compute
     provisioned_action:       tuple = None
     provisioned_return_value: bool  = None
     for reference_item in partial_DB[computed_hash]:
-        if computed_item['path'] == reference_item['path']:
+        if computed_item.path == reference_item.path:
             # same hash+path => same file => should never have been processed twice !
             log_event(
                 Event.OtherProblem,
-                f"File processed twice: {dir_to_hash.as_posix()}/{reference_item['path']}; " +
-                    f"same size: {computed_item['size'] == reference_item['size']}"
+                f"File processed twice: {dir_to_hash.as_posix()}/{reference_item.path}; " +
+                    f"same size: {computed_item.size == reference_item.size}"
             )
             return False
         
-        if computed_item['size'] == reference_item['size']:
+        if computed_item.size == reference_item.size:
             # same hash+size but different path => DuplicateFile
             provisioned_action = (
                 log_event,
                 (
                     Event.DuplicateFile,
                     f"Duplicate detected in '{dir_to_hash.as_posix()}': " +
-                        f"'{computed_item['path']}' vs '{reference_item['path']}'"
+                        f"'{computed_item.path}' vs '{reference_item.path}'"
                 )
             )
             provisioned_return_value = True
@@ -517,8 +623,8 @@ def verify_against_partial( partial_DB: defaultdict, computed_hash: str, compute
         provisioned_action = None
         log_event(
             Event.HashCollision,
-            f"Hash collision in '{dir_to_hash.as_posix()}': '{reference_item['path']}' \
-                vs '{computed_item['path']}'"
+            f"Hash collision in '{dir_to_hash.as_posix()}': '{reference_item.path}' " +
+               f"vs '{computed_item.path}'"
         )
         provisioned_return_value = True
 
@@ -544,11 +650,11 @@ def handle_DB_mismatch( reference_DB: dict, updated_DB: dict ) -> None:
         for computed_item in computed_items:
             for reference_hash, reference_items in reference_DB.items():
                 for reference_item in reference_items:
-                    if computed_item['path'] == reference_item['path']:
+                    if computed_item.path == reference_item.path:
                         # VerificationFailed
                         log_event(
                             Event.VerificationFailed,
-                            f"Hash mismatch on file '{computed_item['path']}': {reference_hash} vs {computed_hash}"
+                            f"Hash mismatch on file '{computed_item.path}': {reference_hash} vs {computed_hash}"
                         )
                         reference_DB[reference_hash].remove(reference_item)
                         break
@@ -558,7 +664,7 @@ def handle_DB_mismatch( reference_DB: dict, updated_DB: dict ) -> None:
         for reference_item in reference_items:
             log_event(
                 Event.FileNotFound,
-                f"Cannot find file '{reference_item['path']}' with hash {reference_hash} and size {reference_item['size']}"
+                f"Cannot find file '{reference_item.path}' with hash {reference_hash} and size {reference_item.size}"
             )
 
 #################### Main ####################
@@ -567,6 +673,7 @@ def main() -> None:
     ''' main
     '''
     global LOG_CFG
+    import time
 
     # Setup phase
     flags = cli_args()
@@ -580,6 +687,7 @@ def main() -> None:
     # post-setup
     LOG.info("Running equilybrium at %s", datetime.datetime.now())
     print_cfg()
+    time.sleep(2)
 
     # Now equilybrium can actually do some work
     reference_DB = load_DB()

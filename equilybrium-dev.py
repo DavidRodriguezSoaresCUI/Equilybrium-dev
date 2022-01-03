@@ -366,7 +366,7 @@ def hash_dir( dir_to_hash: Path, reference_DB: dict, animate: bool = True ) -> d
         elapsed_t,
         total_size_bytes / (elapsed_t * 2**20)
     )
-    LOG.info( "Skipped %d files.", nb_files-processed_files )
+    LOG.info( "Processed %d files; Skipped %d files.", processed_files, nb_files-processed_files )
 
     return _DB
 

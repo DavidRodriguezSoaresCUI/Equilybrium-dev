@@ -20,20 +20,21 @@ with 1M entries would have an estimated size around 200MB.
 
 import argparse
 import configparser
-import datetime
 import functools
 import hashlib
 import itertools
 import json
 import logging
+import pickle
 import sys
 import uuid
 import zlib
 from collections import defaultdict, namedtuple
-from enum    import Enum
-from pathlib import Path
-from time    import time
-from typing  import List, Tuple
+from datetime import datetime
+from enum     import Enum
+from pathlib  import Path
+from time     import time
+from typing   import List, Tuple, Any
 
 try:
     from pympler.asizeof import asizeof
@@ -45,15 +46,26 @@ except ImportError:
 
 # TL;DR: I know. It's okay though, only ``read_config`` may write to it.
 CFG = None
-LOG_CFG = 'stderr+file'
+# DATE_FMT = "%Y%m%d_%H%M"
+SECONDS_BETWEEN_CP = 5
+
 
 #################### Some setup ####################
 
 THIS_FILE = Path( __file__ ).resolve()
+SCRIPT_DIR = THIS_FILE.parent
+LOCK = SCRIPT_DIR / 'AutoYoutubeDL.lock'
+
 LOG_FORMAT = "[%(levelname)s:%(funcName)s] %(message)s"
+LOG_LEVEL = logging.INFO
+LOG_DIR = SCRIPT_DIR / 'logs'
+if not LOG_DIR.is_dir():
+    LOG_DIR.mkdir()
+logging.basicConfig( 
+    level=LOG_LEVEL,
+    format=LOG_FORMAT
+)
 LOG = logging.getLogger( __file__ )
-LOGLEVEL = logging.DEBUG
-LOG.setLevel(level=LOGLEVEL)
 
 DEFAULT_VALUE = {
     zlib.adler32: 1,
@@ -78,12 +90,28 @@ class Event(Enum):
 
 
 @functools.lru_cache(maxsize=None)
-def get_DB_file_path() -> Path:
+def get_data_path() -> Path:
+    ''' Returns base path for DB/event files
+    Q: Why a cached function and not a global constant ?
+    A: Either way is fine.
+    '''
+    #_dir = SCRIPT_DIR / "data" / CFG['role'] / datetime.now().strftime(DATE_FMT)
+    #assert _dir.is_dir() is False
+    _dir = SCRIPT_DIR / "data"
+    if not (CFG['read_only'] or _dir.is_dir()):
+        _dir.mkdir(parents=True)
+    return _dir
+
+
+@functools.lru_cache(maxsize=None)
+def get_DB_file_path(override_role: str = None) -> Path:
     ''' Returns path to DB file
     Q: Why a cached function and not a global constant ?
     A: Either way is fine.
     '''
-    return THIS_FILE.with_suffix( f".{CFG['role']}.DB.json" )
+    if override_role:
+        return get_data_path() / f"{override_role}.DB.json"
+    return get_data_path() / f"{CFG['role']}.DB.json"
 
 
 @functools.lru_cache(maxsize=None)
@@ -92,14 +120,14 @@ def get_event_file_path( event: Event ) -> Path:
     Q: Why a cached function and not a global constant ?
     A: Either way is fine.
     '''
-    return THIS_FILE.with_suffix( f".{CFG['role']}.{event}.log" )
+    return get_data_path() / f"{CFG['role']}.{event}.log"
 
 
 def log_event( event: Event, msg: str ) -> None:
     ''' Logs (appends) message into the correct file given role and event type.
     '''
     if CFG['read_only']:
-        LOG.debug("--simulate: Did not log event to file")
+        LOG.info("--simulate: Did not log event to file")
         LOG.info("%s: %s", event, msg)
         return
     event_f = get_event_file_path( event )
@@ -126,7 +154,7 @@ def save_DB( _DB: dict ) -> None:
     _DB_f.write_text(json.dumps(_DB, indent=2))
 
 
-def load_DB() -> dict:
+def load_DB( override_role: str = None ) -> dict:
     ''' Load previously generated DB object from file.
     Returns None on DB file not existing
     '''
@@ -140,7 +168,7 @@ def load_DB() -> dict:
             del db[k]
         return db
 
-    _DB_f = get_DB_file_path()
+    _DB_f = get_DB_file_path( override_role )
     if _DB_f.is_file():
         res = decode_DB_entries(json.loads(_DB_f.read_text() ))
         LOG.info("Loading DB from file '%s' (%d elements)", _DB_f, len(res))
@@ -223,34 +251,69 @@ def file_collector( root: Path ) -> Tuple[int,Path,int]:
             yield idx, item, item.stat().st_size
 
 
-class MySpinner:
-    ''' My simple spinner, one-function, easy to use and supports text
-    on the left of the spinning wheel !
+class CheckPoint:
+    ''' Saves partial progress to file, makes it easier to continue from
+    interrupted execution
     '''
+    SAVE_LOCATION = SCRIPT_DIR / 'tmp'
+    def __init__( self, file_name: str ) -> None:
+        if CFG['read_only']:
+            self.file = None 
+            return
+        if not self.SAVE_LOCATION.is_dir():
+            self.SAVE_LOCATION.mkdir()
+        self.file = self.SAVE_LOCATION / file_name
 
-    def __init__( self ) -> None:
-        self.last_txt_len = 0
-        self.spinner = itertools.cycle(['-', '\\', '|', '/'])
+    def load_progress( self, default: Any = None ) -> Any:
+        ''' Loads progress from checkpoint file '''
+        if self.file is None or not self.file.is_file():
+            return default
+        return pickle.loads(self.file.read_bytes())
+
+    def save_progress( self, data: Any ) -> None:
+        ''' Saves progress to checkpoint file '''
+        if self.file is None:
+            return
+        LOG.info("Saving progress to %s", self.file)
+        self.file.write_bytes( pickle.dumps(data) )
+
+    def remove( self ) -> None:
+        ''' Deletes checkpoint file '''
+        if self.file is None:
+            return
+        if self.file.is_file():
+            LOG.info("Removing checkpoint %s", self.file.name)
+            self.file.unlink()
 
 
-    def animation( self, text: str = '', no_spinner: bool = False ):
-        ''' update animation, with the option to print text on the left of the
-        spinner character
-        '''
-        tmplen = (self.last_txt_len + 1)
-        # erase previous message
-        # why do backspaces, then whitespace, then backspaces again :
-        # because backspace alone didn't consistently erase previous text
-        sys.stdout.write( '\b' * tmplen + ' ' * tmplen + '\b' * tmplen ) 
+# class MySpinner:
+#     ''' My simple spinner, one-function, easy to use and supports text
+#     on the left of the spinning wheel !
+#     '''
 
-        # write new message, truncated to not overflow terminal width (necessary for best results)
-        spinner_symbol = '' if no_spinner else next(self.spinner)
-        message = text + spinner_symbol
-        sys.stdout.write( 
-            message
-        )
-        sys.stdout.flush()
-        self.last_txt_len = len( message ) - (0 if no_spinner else 1)
+#     def __init__( self ) -> None:
+#         self.last_txt_len = 0
+#         self.spinner = itertools.cycle(['-', '\\', '|', '/'])
+
+
+#     def animation( self, text: str = '', no_spinner: bool = False ):
+#         ''' update animation, with the option to print text on the left of the
+#         spinner character
+#         '''
+#         tmplen = (self.last_txt_len + 1)
+#         # erase previous message
+#         # why do backspaces, then whitespace, then backspaces again :
+#         # because backspace alone didn't consistently erase previous text
+#         sys.stdout.write( '\b' * tmplen + ' ' * tmplen + '\b' * tmplen ) 
+
+#         # write new message, truncated to not overflow terminal width (necessary for best results)
+#         spinner_symbol = '' if no_spinner else next(self.spinner)
+#         message = text + spinner_symbol
+#         sys.stdout.write( 
+#             message
+#         )
+#         sys.stdout.flush()
+#         self.last_txt_len = len( message ) - (0 if no_spinner else 1)
 
 #################### Hash-related functions ####################
 
@@ -279,7 +342,19 @@ def file_digest( _file: Path ) -> int:
         return digest
 
 
-def hash_dir( dir_to_hash: Path, reference_DB: dict, animate: bool = True ) -> dict:
+# def tmp_file( base_name: str ) -> Path:
+#     ''' Returns the path to an available temporary file '''
+
+#     idx = 0
+#     while True:
+#         filename = CFG['role'] + (f' ({idx})' if idx>0 else '') + '.tmp'
+#         _f = SCRIPT_DIR / filename
+#         idx += 1
+#         if not _f.is_file():
+#             return _f
+
+
+def hash_dir( dir_to_hash: Path, reference_DB: dict ) -> tuple:
     ''' Given a directory, hash all files in it recursively,
     then return a dictionnary:
       { 
@@ -289,36 +364,46 @@ def hash_dir( dir_to_hash: Path, reference_DB: dict, animate: bool = True ) -> d
     Note: file_relative_path is a posix-style relative path rooted at
     user-selected directory (non-inclusive)
     '''
-    
-    # File collection and hashing
-    _DB = defaultdict(list)
-    total_size_bytes: int = 0 # count processed bytes
-    processed_files : int = 0 # count processed files
+
     LOG.info("Processing directory '%s' ..", dir_to_hash)
     nb_files = file_count( dir_to_hash )
+    _DB = defaultdict(list)
+    _seen = set()
 
     if nb_files==0:
         LOG.info("No file to process")
-        return _DB
+        return _DB, reference_DB    
+    
+    # Load checkpoint for `_DB` and `reference_DB`
+    checkpoint = CheckPoint( CFG['role']+'_hash_dir.tmp' )
+    last_cp = checkpoint.load_progress()
+    if last_cp and last_cp[2]==dir_to_hash:
+        _DB.update(last_cp[0])
+        reference_DB = last_cp[1]
+        _seen = set( entry.path for entries in _DB.values() for entry in entries )
+        LOG.info("Continuing from checkpoint: %d files processed!", len(list(_seen)))
+
+    total_size_bytes: int = 0 # count processed bytes
+    processed_files : int = 0 # count processed files
+    start_t = checkpoint_t = time()
+    for idx,_file,file_size in file_collector( dir_to_hash ):
         
-    spinner = MySpinner()
-    start_t = progress_t = time()
-    for idx,_file, file_size in file_collector( dir_to_hash ):
-        # stdout progress animation
-        if animate:
-            spinner.animation( f"[{idx+1}/{nb_files}] ({total_size_bytes / max((time()-start_t) * 2**20,1):.1f} MiB/s) " )
-
-        # log progress to file every 5 seconds
-        if 'file' in LOG_CFG and time() - progress_t > 5:
-            THIS_FILE.with_suffix(f".{CFG['role']}.progress").write_text(
-                f"{dir_to_hash} [{idx+1}/{nb_files}] ({total_size_bytes / max((time()-start_t) * 2**20,1):.1f} MiB/s)",
-                encoding='utf8'
-            )
-            progress_t = time()
-
         # Filter out files that are too small
         if file_size < CFG['min_file_size']:
             continue
+
+        _file_path = _file.as_posix() # relative_to(dir_to_hash).
+
+        # Skip if already hashed
+        if _file_path in _seen:
+            LOG.debug("Skipping file")
+            continue
+        
+        # Periodically save progress
+        _now = time()
+        if _now - checkpoint_t > SECONDS_BETWEEN_CP:
+            checkpoint_t = _now
+            checkpoint.save_progress( [_DB, reference_DB, dir_to_hash] )
         
         # compute file digest
         try:
@@ -332,7 +417,7 @@ def hash_dir( dir_to_hash: Path, reference_DB: dict, animate: bool = True ) -> d
         total_size_bytes += file_size
         entry = DB_entry(
             size=file_size,
-            path=_file.relative_to(dir_to_hash).as_posix()
+            path=_file_path
         )
         
         # We need to check for hash collisions in the partial DB before adding
@@ -351,12 +436,11 @@ def hash_dir( dir_to_hash: Path, reference_DB: dict, animate: bool = True ) -> d
             if not reference_DB[_hash]:
                 del reference_DB[_hash]
 
+        # log progress
+        LOG.info("%s [%d/%d] (%.1f MiB/s)", dir_to_hash, idx, nb_files, (total_size_bytes / max((time()-start_t) * 2**20,1)) )
+
         # finally add entry
         _DB[_hash].append(entry)
-
-    if animate:
-        # add end of line
-        print("")
     
     # Performance logging
     elapsed_t = time() - start_t
@@ -368,7 +452,9 @@ def hash_dir( dir_to_hash: Path, reference_DB: dict, animate: bool = True ) -> d
     )
     LOG.info( "Processed %d files; Skipped %d files.", processed_files, nb_files-processed_files )
 
-    return _DB
+    checkpoint.remove()
+
+    return _DB, reference_DB
 
 #################### Settings-related functions ####################
 
@@ -398,40 +484,36 @@ def cli_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def set_LOG_handlers( _file: Path = None ) -> None:
+def set_LOG_handlers() -> None:
     ''' Sets destination(s) for LOG messages
     required: <LOG_CFG:str>; recogsizes: existence of substrings 'file' and 'stderr'
     examples: 'stderr', 'file+stderr', 'geoig8943file0934utg'
     '''
+    global CFG
+
+    if cli_args().simulate:
+        LOG.info("--simulate: no filehandler were added")
+        return
 
     for _handler in list(LOG.handlers):
-        LOG.removeHandler( _handler )
-
-    _formatter = logging.Formatter( LOG_FORMAT )
+        if isinstance(_handler, logging.FileHandler):
+            LOG.removeHandler( _handler )
 
     # create file handler for logger.
-    if 'file' in LOG_CFG:
-        role = CFG['role'] if CFG is not None else ''
-        fh = logging.FileHandler(
-            filename=THIS_FILE.with_suffix(f'.{role}.log') if _file is None else _file,
-            mode='a',
-            encoding='utf8'
-        )
-        fh.setLevel(level=LOGLEVEL)
-        fh.setFormatter( _formatter )
-        # add handlers to logger.
-        LOG.addHandler(fh)
-
-    # create console handler for logger.
-    if 'stderr' in LOG_CFG:
-        # Bug countermeasure: do not add StreamHandler if one already exist
-        sh = logging.StreamHandler()
-        sh.setLevel(level=logging.DEBUG)
-        sh.setFormatter( _formatter )
-        LOG.addHandler(sh)
+    assert CFG is not None and 'role' in CFG
+    _logfile = LOG_DIR / "{}_{}.log".format(CFG['role'], datetime.now().strftime("%Y%m%d_%H%M"))
+    fh = logging.FileHandler(
+        filename=str(_logfile),
+        mode='w',
+        encoding='utf8'
+    )
+    fh.setLevel(level=LOG_LEVEL)
+    fh.setFormatter( logging.Formatter( LOG_FORMAT ) )
+    # add handlers to logger.
+    LOG.addHandler(fh)
 
 
-def read_config() -> dict:
+def read_config() -> None:
     ''' Reads config from equilibrium.ini
     '''
     global CFG
@@ -670,35 +752,86 @@ def handle_DB_mismatch( reference_DB: dict, updated_DB: dict ) -> None:
                 f"Cannot find file '{reference_item.path}' with hash {reference_hash} and size {reference_item.size}"
             )
 
+
+def generate_report() -> None:
+    ''' Generates status report of the state of
+    files between A and B. This can only be done
+    by A.
+    '''
+    assert CFG['role']=='A', "Only computer with role 'A' can generate report"
+
+    # Load DBs for comparison
+    A_DB, B_DB = load_DB( override_role='A' ), load_DB( override_role='B' )
+
+    # neutralize identical items
+    common_file_count = 0
+    for _hash in A_DB:
+        for _a_entry_idx, _a_entry in enumerate(A_DB[_hash]):
+            _b_entry_idx = next(
+                __b_entry_idx
+                for __b_entry_idx, __b_entry in enumerate(B_DB[_hash])
+                if _a_entry['size']==__b_entry['size'] # same hash+size => same entry
+            )
+            if _b_entry_idx:
+                del A_DB[_hash][_a_entry_idx]
+                del B_DB[_hash][_b_entry_idx]
+                common_file_count += 1
+                continue
+
+    list_exclusives = lambda _db: [ e.path for entries in _DB.values() for e in entries ]
+
+    # Generate report with differences
+    _report_f = SCRIPT_DIR / f'report_{datetime.now().strftime("%Y%m%d_%H%M")}.txt'
+    with _report_f.open('w',encoding='utf8') as f:
+        f.write('[Equilybrium report]')
+        f.write(f"\n\nCommon files: {common_file_count}")
+        f.write(f"\n\nFiles exclusive to A:")
+        f.write('\n > '.join(list_exclusives(A_DB)))
+        f.write(f"\n\nFiles exclusive to B:")
+        f.write('\n > '.join(list_exclusives(B_DB)))
+
 #################### Main ####################
 
 def main() -> None:
     ''' main
     '''
-    global LOG_CFG
-    import time
 
     # Setup phase
     flags = cli_args()
-    if flags.no_log_file:
-        LOG_CFG = 'stderr'
-        set_LOG_handlers() # disable logging to log file; stderr only
-
     read_config()
     CFG['read_only'] = flags.simulate
 
+    if flags.write_report:
+        generate_report()
+        return
+
     # post-setup
-    LOG.info("Running equilybrium at %s", datetime.datetime.now())
+    LOG.info("Running equilybrium at %s", datetime.now())
     print_cfg()
-    time.sleep(2)
+
+    # Checkpoint
+    checkpoint = CheckPoint( CFG['role']+'_main.tmp' )
+    last_cp = checkpoint.load_progress()
+    if last_cp:
+        reference_DB, updated_DB, _processed_dirs = last_cp
+        LOG.info("Continuing from checkpoint: %d directories processed!", len(_processed_dirs))
+    else:
+        reference_DB = load_DB()
+        updated_DB = dict()
+        _processed_dirs = []
 
     # Now equilybrium can actually do some work
-    reference_DB = load_DB()
-    updated_DB = dict()
     for _dir in CFG['dirs']:
-        _dir_DB = hash_dir( _dir, reference_DB )
+        if _dir in _processed_dirs:
+            LOG.info("Skipped dir %s: already processed!", _dir.as_posix())
+            continue
+        _dir_DB, reference_DB = hash_dir( _dir, reference_DB )
         updated_DB.update(_dir_DB)
+        _processed_dirs.append(_dir)
+        checkpoint.save_progress( [reference_DB,updated_DB,_processed_dirs] )
 
+    # cleanup
+    checkpoint.remove()
     handle_DB_mismatch( reference_DB, updated_DB )
     save_DB( updated_DB )
     show_DB_file_size( updated_DB )
@@ -710,6 +843,5 @@ def main() -> None:
 
 
 if __name__=='__main__':
-    set_LOG_handlers() # to catch all messages on systems without visibility on stderr
     main()
     LOG.info("END OF PROGRAM")

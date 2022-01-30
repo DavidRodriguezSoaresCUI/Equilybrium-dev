@@ -380,8 +380,6 @@ def preserve_data() -> None:
 def restore_data() -> None:
     ''' Moves 'data' folder to avoid overwriting and conflicting data
     '''
-    TMP = EQUILYBRIUM_DIR.with_name('data_OLD')
-    assert TMP.is_dir()
 
     print("Restoring preserved 'data' files")
 
@@ -393,8 +391,10 @@ def restore_data() -> None:
                 _path.unlink()
         EQUILYBRIUM_DIR.rmdir()
 
-    print(f"Renaming {TMP} -> {EQUILYBRIUM_DIR}")
-    TMP.rename(EQUILYBRIUM_DIR)
+    TMP = EQUILYBRIUM_DIR.with_name('data_OLD')
+    if TMP.is_dir():
+        print(f"Renaming {TMP} -> {EQUILYBRIUM_DIR}")
+        TMP.rename(EQUILYBRIUM_DIR)
 
 
 if __name__=='__main__':

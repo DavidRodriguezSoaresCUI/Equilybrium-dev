@@ -1,8 +1,10 @@
 # [Equilybrium](https://github.com/DavidRodriguezSoaresCUI/Equilybrium-dev)
 
+> WARNING: This is a fast-evolving project that offers no guarantee of behaviour stability or continued maintaining by the author. Use at your own risk !
+
 Equilybrium is a solution that monitors your files and their backup in a flexible way for a specific use case.
 
-For more information, read [``equilybrium-whitepaper``](https://github.com/DavidRodriguezSoaresCUI/Equilybrium-dev/blob/main/equilybrium-whitepaper.md).
+For more information, read [``equilybrium-whitepaper``](https://github.com/DavidRodriguezSoaresCUI/Equilybrium-dev/blob/main/equilybrium-whitepaper.github_encoding.md).
 
 Note: examples below call the ``Python 3 interpreter`` using command ``python``, but on your system it could be bound to ``python3``.
 

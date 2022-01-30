@@ -4,4 +4,6 @@
 *.log
 *.progress
 equilybrium.config.ini
+__pycache__
+*.pyc
 

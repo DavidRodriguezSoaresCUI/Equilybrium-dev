@@ -20,6 +20,7 @@ with 1M entries would have an estimated size around 200MB.
 
 import argparse
 import configparser
+import datetime
 import functools
 import itertools
 import json
@@ -35,7 +36,7 @@ from typing   import List, Tuple, Any, Iterable
 
 from lib.events import Event
 from lib.hashing import file_digest
-from lib.utils import current_date, execute_if_not_readonly, cli_args, read_config
+from lib.utils import current_date, execute_if_not_readonly, cli_args, read_config, format_time_duration
 from lib.checkpoint import CheckPoint
 from lib.database import DB_entry, load_DB, save_DB, show_DB_file_size, update_database, handle_db_mismatch
 from lib.global_var import get_global_variables
@@ -68,11 +69,13 @@ GV.LOG = LOG = logging.getLogger( __file__ )
 
 #################### Helper functions/classes ####################
 
-def print_cfg() -> None:
+def print_cfg(only_return_str: bool = False) -> None:
     ''' For debug purposes
     '''
     msg = "Config:\n" + '\n'.join( f"> '{k}': {v} ({type(v)})" for k,v in GV.CFG.items() )
-    msg += "\nMonitored directories:\n" + '\n'.join( f"> {_dir}" for _dir in GV.CFG['dirs'] )
+    msg += "\nMonitored directories:\n" + ('\n'.join( f"> {_dir}" for _dir in GV.CFG['dirs'] ) if GV.CFG['dirs'] else '<NOTHING>')
+    if only_return_str:
+        return msg
     LOG.debug( msg )
 
 #################### Hash-related functions ####################
@@ -250,19 +253,20 @@ def generate_report() -> None:
 
     # neutralize identical items
     common_file_count = 0
+    common_hash_count = 0
     for _hash in A_DB:
-        for _a_entry_idx, _a_entry in enumerate(A_DB[_hash]):
-            _b_entry_idx = next(
-                __b_entry_idx
-                for __b_entry_idx, __b_entry in enumerate(B_DB[_hash])
-                if _a_entry['size']==__b_entry['size'] # same hash+size => same entry
-            )
-            if _b_entry_idx:
-                del A_DB[_hash][_a_entry_idx]
-                del B_DB[_hash][_b_entry_idx]
-                common_file_count += 1
-                continue
-
+        if _hash not in B_DB:
+            continue
+        common_hash_count += 1
+        for _a_entry in list(A_DB[_hash]):
+            for _b_entry in B_DB[_hash]:
+                # same hash+size => same entry
+                if _a_entry.size==_b_entry.size: 
+                    A_DB[_hash].remove(_a_entry)
+                    B_DB[_hash].remove(_b_entry)
+                    common_file_count += 1
+                    break
+    
     list_exclusives = lambda _db: [ e.path for entries in _db.values() for e in entries ]
 
     # Generate report with differences
@@ -271,9 +275,9 @@ def generate_report() -> None:
         f.write('[Equilybrium report]')
         f.write(f"\n\nCommon files: {common_file_count}")
         f.write("\n\nFiles exclusive to A:")
-        f.write('\n > '.join(list_exclusives(A_DB)))
+        f.write('\n > ' + '\n > '.join(list_exclusives(A_DB)))
         f.write("\n\nFiles exclusive to B:")
-        f.write('\n > '.join(list_exclusives(B_DB)))
+        f.write('\n > ' + '\n > '.join(list_exclusives(B_DB)))
 
 
 def run_scanners(scanners: List[Scanner], abort_switch: threading.Event) -> dict:
@@ -303,6 +307,28 @@ def run_scanners(scanners: List[Scanner], abort_switch: threading.Event) -> dict
     
     return res
 
+
+def write_scanner_report( scanners: List[Scanner] ) -> None:
+    ''' Generate 'end of work' report
+    '''
+    report_file = GV.SCRIPT_DIR / 'data' / f"{GV.CFG['role']}.report.{current_date()}.log"
+    with report_file.open('w', encoding='utf8') as f:
+        f.write("[Scanner Report]\n")
+        f.write(f"Date: {current_date()}\n")
+        f.write(print_cfg(only_return_str=True))
+        f.write("\n\nScanner stats:\n")
+        for idx,_scanner in enumerate(scanners):
+            _tmp = ', '.join( f"{k}:{v}" for k,v in _scanner.stats.items() )
+            f.write( f'[{idx}] ' + _tmp + '\n' )
+        f.write("\nStats:\n")
+        f.write(f"> Elapsed time: {format_time_duration(time() - GV.ScannerStart)}\n")
+        total_files_read = sum(_scanner.stats['nb_files_read'] for _scanner in scanners)
+        f.write(f"> Total files read: {total_files_read}\n")
+        total_files_skipped = sum(_scanner.stats['nb_files_skipped'] for _scanner in scanners)
+        f.write(f"> Total files skipped: {total_files_skipped}\n")
+        total_MiB_read = sum(_scanner.stats['MiB_read'] for _scanner in scanners)
+        f.write(f"> Total MiB read: {total_MiB_read}\n")
+        
 #################### Main ####################
 
 def main() -> None:
@@ -331,6 +357,7 @@ def main() -> None:
         return res
 
     # Now equilybrium can actually do some work
+    GV.ScannerStart = time()
     abort_switch = threading.Event()
     scanners = [
         Scanner(__directories, idx, abort_switch)
@@ -338,6 +365,7 @@ def main() -> None:
     ]
     
     updated_DB = run_scanners(scanners, abort_switch)
+    write_scanner_report( scanners )
     
     # cleanup
     handle_db_mismatch( reference_DB, updated_DB )

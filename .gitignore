@@ -6,4 +6,7 @@
 equilybrium.config.ini
 __pycache__
 *.pyc
+test/
+report_*.txt
+*.7z
 

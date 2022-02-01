@@ -8,14 +8,51 @@ import functools
 import hashlib
 import json
 import logging
+import sys
 import uuid
 import zlib
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Any
+from typing import Callable, Any, Union
 from lib.global_var import get_global_variables
 
 GV = get_global_variables()
+
+DEFAULT_CONFIG = '''[Settings]
+# System IDs are required for Equilybrium to identify their role and create
+# their files.
+# `ID method`: for now, only 'Python uuid' is implemented
+ID_method = Python uuid
+A = 
+B = 
+# Hashing settings
+# `Hash algorithm` must be one of: 'md5', 'sha1', 'sha224', 'sha256', 'sha384',
+# 'sha512', 'blake2b', 'blake2s', 'sha3_224', 'sha3_256', 'sha3_384',
+# 'sha3_512', 'adler32', 'crc32' (without quotes; suffixed by corresponding
+# library 'hashlib.' or 'zlib.')
+Hash_algorithm = zlib.adler32
+# Can be any integer; only edit this value if you determined it is suboptimal
+# on your systems
+Block_size = 2 ** 18
+# Set to role that should avoid directories beginning with '@' symbol (Synology NAS)
+Avoid_at_dirs = 
+# Set minimum file size to be processed, in bytes
+Min_file_size = 100
+# Whether or not to process files with no extension
+Include_files_with_no_extension = False
+# List excluded extensions. Format: comma-separated values, case insensitive, with or without '.'
+Excluded_extensions = 
+
+[Monitored Directories]
+# Which directories contains files to monitor, on each system ?
+# List here between double quotes the absolute path to these folders
+A = [
+    ""
+    ]
+B = [
+    ""
+    ]
+'''
 
 def current_date() -> str:
     ''' Returns string representation of current date.
@@ -127,13 +164,25 @@ def set_LOG_handlers(role_override: str = None) -> None:
     GV.LOG.addHandler(fh)
 
 
+def make_config( file_path: Path ) -> None:
+    ''' Generate a default config file for the user to complete
+    ''' 
+    GV.LOG.info("No config file found; generating %s ..", file_path)
+    file_path.write_text(DEFAULT_CONFIG, encoding='utf8')
+    GV.LOG.info("Please fill config file %s with appropriate values.", file_path)
+    GV.LOG.info("Note: current machine UUID is %d", uuid.getnode())
+
+
 def read_config() -> dict:
     ''' Reads config from equilibrium.ini
     '''
 
     # open file and read config
     config_file = GV.THIS_FILE.parent / 'equilybrium.config.ini'
-    assert config_file.is_file(), f"Could not find file '{config_file}' !"
+    if not config_file.is_file():
+        make_config(config_file)
+        sys.exit(0)
+
     config = configparser.ConfigParser()		
     config.read( config_file, encoding='utf8' )
 
@@ -190,8 +239,11 @@ def read_config() -> dict:
     CFG['dirs'] = [
         Path( _dir )
         for _dir in json.loads(monitored_dirs_s.replace('\\', '\\\\'))
+        if len(_dir)>0
     ] if monitored_dirs_s else []
     # Directory existence verification
+    if not CFG['dirs']:
+        raise ValueError("'Monitored directories' is empty!")
     warnings = False
     for _dir in CFG['dirs']:
         if not _dir.is_dir():
@@ -208,3 +260,15 @@ def read_config() -> dict:
     equilybrium_f = Path( __file__ ).resolve()
     CFG['DB_file'] = equilybrium_f.with_suffix( f".{CFG['role']}.DB.json" )
     return CFG
+
+
+def format_time_duration(seconds: Union[int,float]) -> str:
+    ''' Format time duration in a human-friendly way
+    '''
+    assert seconds>=0
+    _h, _remainder = divmod(seconds, 3600)
+    _m, _s = divmod(_remainder, 60)
+    _time = ''.join(f"{int(x):02}{y}" for x,y in zip([_h,_m,_s],['H','M','S']) if x!=0 or y=='S')
+    if len(_time)>2:
+        return _time.lstrip('0')
+    return _time

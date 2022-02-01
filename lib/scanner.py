@@ -66,6 +66,14 @@ class Scanner(threading.Thread):
         self._cp = CheckPoint(file_name=f"{self._id}.tmp")
         self._done = False
         self._kill_thread = kill_thread
+        self._stats = { k:0 for k in ('nb_files_read','nb_files_skipped','MiB_read','execution_time_s') }
+
+    
+    @property
+    def stats(self) -> dict:
+        ''' Return stats '''
+        assert self._done and self._stats, "Bad call, instance unprepared or improperly configured."
+        return self._stats
 
 
     def hash_dir(self, dir_to_hash: Path) -> dict:
@@ -144,12 +152,17 @@ class Scanner(threading.Thread):
         
         # Performance logging
         elapsed_t = time() - start_t
+        _local_MiB_read = total_size_bytes / 2**20
         GV.LOG.info(
             "Hashed %.1f MiB in %.1f s : %.1f MiB/s",
-            total_size_bytes / 2**20,
+            _local_MiB_read,
             elapsed_t,
             throughput_MiB()
         )
+        self._stats['MiB_read'] += _local_MiB_read
+        self._stats['execution_time_s'] += elapsed_t
+        self._stats['nb_files_read'] += processed_files
+        self._stats['nb_files_skipped'] += nb_files-processed_files
         GV.LOG.info( "Processed %d files; Skipped %d files.", processed_files, nb_files-processed_files )
 
         # cleanup: remove checkpoint at the end

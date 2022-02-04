@@ -42,6 +42,8 @@ Min_file_size = 100
 Include_files_with_no_extension = False
 # List excluded extensions. Format: comma-separated values, case insensitive, with or without '.'
 Excluded_extensions = 
+# List excluded files. Format: comma-separated values, case sensitive (ex: Thumbs.db in Windows)
+Excluded_files = 
 
 [Monitored Directories]
 # Which directories contains files to monitor, on each system ?
@@ -118,7 +120,7 @@ def cli_args() -> argparse.Namespace:
     )
     special_modes = parser.add_mutually_exclusive_group()
     special_modes.add_argument(
-        '-s', '--simulate',
+        '--simulate',
         action='store_true',
         help='Run as read only; do not generate files'
     )
@@ -127,19 +129,17 @@ def cli_args() -> argparse.Namespace:
         action='store_true',
         help='Only write report'
     )
-    parser.add_argument(
-        '--no_log_file',
+    special_modes.add_argument(
+        '--differential_scan',
         action='store_true',
-        help='Redirects LOG messages to file'
+        help='Only scan files that are NOT in database. This is useful for a quick "update" when editing configuration for example.'
     )
     return parser.parse_args()
 
 
 @execute_if_not_readonly(message='No filehandler were added')
 def set_LOG_handlers(role_override: str = None) -> None:
-    ''' Sets destination(s) for LOG messages
-    required: <LOG_CFG:str>; recogsizes: existence of substrings 'file' and 'stderr'
-    examples: 'stderr', 'file+stderr', 'geoig8943file0934utg'
+    ''' Sets file as secondary output for LOG messages
     '''
 
     for _handler in list(GV.LOG.handlers):
@@ -216,7 +216,7 @@ def read_config() -> dict:
     # Allows to skip small files
     CFG['min_file_size'] = _settings.getint( 'Min_file_size' )
 
-    # Allows to skip certain extensions
+    # Allows to skip certain extensions/files
     CFG['excluded_extensions'] = set()
     excl_ext = _settings.get('Excluded_extensions')
     if excl_ext and isinstance(excl_ext, str):
@@ -226,6 +226,13 @@ def read_config() -> dict:
                 _item.strip().lower()
                 for _item in excl_ext.split(',')
             ]
+        )
+    CFG['excluded_files'] = set()
+    excl_f = _settings.get('Excluded_files')
+    if excl_f and isinstance(excl_f, str):
+        CFG['excluded_files'] = set( 
+            _item.strip()
+            for _item in excl_f.split(',')
         )
 
     # Should files with no extension be included ?

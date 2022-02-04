@@ -4,6 +4,7 @@
 
 import json
 from collections import namedtuple, defaultdict
+from pathlib import Path
 
 try:
     from pympler.asizeof import asizeof
@@ -219,6 +220,10 @@ def handle_db_mismatch(reference_db: dict, updated_db: dict) -> None:
     # Anything remaining in ref_uniques is FileNotFound
     for ref_hash in ref_uniques:
         for _entry in ref_uniques[ref_hash]:
+            _entry_path = Path(_entry.path)
+            if _entry_path.suffix in GV.CFG['excluded_extensions'] or _entry_path.name in GV.CFG['excluded_files']:
+                # Excluding previously-allowed extension/file names should not trigger a FileNotFound event
+                continue
             Event.log_event(
                 Event.FileNotFound,
                 {'path': _entry.path}
@@ -233,4 +238,15 @@ def handle_db_mismatch(reference_db: dict, updated_db: dict) -> None:
                 Event.NewFile,
                 {'path': _entry.path}
             )
+
+
+def reverse_database(_db: dict) -> dict:
+    ''' Takes a { <hash:int> : <entry:DB_entry> } and returns
+    a { <posix_path:str>: <hash:int> } reversed database
+    '''
+    return {
+        entry.path: _hash 
+        for _hash, entries in _db.items()
+        for entry in entries
+    }
             

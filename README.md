@@ -12,15 +12,16 @@ Note: examples below call the ``Python 3 interpreter`` using command ``python``,
 
 ```
 $ python equilybrium-dev.py --help
-usage: Equilybrium (dev) [-h] [-s | --write_report] [--no_log_file]
+usage: Equilybrium (dev) [-h] [--simulate | --write_report | --differential_scan]
 
 Contains uncategorized utils
 
 optional arguments:
-  -h, --help      show this help message and exit
-  -s, --simulate  Run as read only; do not generate files
-  --write_report  Only write report
-  --no_log_file   Redirects LOG messages to file
+  -h, --help           show this help message and exit
+  --simulate           Run as read only; do not generate files
+  --write_report       Only write report
+  --differential_scan  Only scan files that are NOT in database. This is useful for a quick "update" when editing
+                       configuration for example.
 ```
 To run it, simply use:
 ```

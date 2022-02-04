@@ -38,7 +38,7 @@ from lib.events import Event
 from lib.hashing import file_digest
 from lib.utils import current_date, execute_if_not_readonly, cli_args, read_config, format_time_duration
 from lib.checkpoint import CheckPoint
-from lib.database import DB_entry, load_DB, save_DB, show_DB_file_size, update_database, handle_db_mismatch
+from lib.database import DB_entry, load_DB, save_DB, show_DB_file_size, update_database, handle_db_mismatch, reverse_database
 from lib.global_var import get_global_variables
 from lib.scanner import Scanner
 
@@ -56,7 +56,7 @@ GV.LOCK = GV.SCRIPT_DIR / 'AutoYoutubeDL.lock'
 
 #################### Setting up logging ####################
 
-GV.LOG_LEVEL = logging.DEBUG
+GV.LOG_LEVEL = logging.DEBUG if Path('debug').is_file() else logging.INFO
 GV.LOG_FORMAT = "[%(levelname)s:%(funcName)s] %(message)s" if GV.LOG_LEVEL==logging.DEBUG else "[%(levelname)s] %(message)s"
 GV.LOG_DIR = GV.SCRIPT_DIR / 'logs'
 if not GV.LOG_DIR.is_dir():
@@ -357,10 +357,16 @@ def main() -> None:
         return res
 
     # Now equilybrium can actually do some work
+    inverted_ref = reverse_database(reference_DB) if flags.differential_scan else None
     GV.ScannerStart = time()
     abort_switch = threading.Event()
     scanners = [
-        Scanner(__directories, idx, abort_switch)
+        Scanner(
+            directories=__directories,
+            n=idx,
+            kill_thread=abort_switch,
+            use_reference=inverted_ref
+        )
         for idx,__directories in enumerate(group_by_drive(GV.CFG['dirs']).values())
     ]
     

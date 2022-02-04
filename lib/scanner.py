@@ -41,6 +41,7 @@ def file_collector( root: Path ) -> Tuple[int,Path,int]:
         valid_file = (
             ('$RECYCLE.BIN' not in item.parts) # do not collect files in the trash
             and (item.suffix not in GV.CFG['excluded_extensions']) # exclude files with certain extensions
+            and (item.name not in GV.CFG['excluded_files']) # exclude certain files
             and ( # conditionnally avoid directories beginning with '@' symbol
                 (GV.CFG['avoid_at_dirs'] is False)
                 or (not any( p.startswith('@') for p in item.parts[:-1] ))
@@ -53,7 +54,7 @@ def file_collector( root: Path ) -> Tuple[int,Path,int]:
 class Scanner(threading.Thread):
     ''' threading.Thread subclass; hashes arbitrary directory contents '''
 
-    def __init__(self, directories: List[Path], n: int, kill_thread: threading.Event) -> None:
+    def __init__(self, directories: List[Path], n: int, kill_thread: threading.Event, use_reference: dict = None) -> None:
         # calling parent class constructor
         threading.Thread.__init__(self)
         # setting up instance variables
@@ -67,6 +68,8 @@ class Scanner(threading.Thread):
         self._done = False
         self._kill_thread = kill_thread
         self._stats = { k:0 for k in ('nb_files_read','nb_files_skipped','MiB_read','execution_time_s') }
+        # Warning: reference must be { <posix_path:str>: <hash:int> }
+        self._reference = use_reference
 
     
     @property
@@ -125,12 +128,16 @@ class Scanner(threading.Thread):
                 local_cp.save_progress( (local_db, _hashed_files, dir_to_hash) )
             
             # compute file digest
-            GV.LOG.debug("Hashing file %s", _file_path)
-            try:
-                _hash = file_digest(_file)
-            except PermissionError:
-                GV.LOG.warning("Could not access '%s' !", _file_path)
-                continue
+            if self._reference and _file_path in self._reference:
+                GV.LOG.debug("Reading hash from reference for file %s", _file_path)
+                _hash = self._reference[_file_path]
+            else:
+                GV.LOG.debug("Hashing file %s", _file_path)
+                try:
+                    _hash = file_digest(_file)
+                except PermissionError:
+                    GV.LOG.warning("Could not access '%s' !", _file_path)
+                    continue
             
             # update stats and build entry
             processed_files += 1

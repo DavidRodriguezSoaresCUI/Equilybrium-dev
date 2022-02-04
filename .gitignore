@@ -9,4 +9,5 @@ __pycache__
 test/
 report_*.txt
 *.7z
+debug
 
